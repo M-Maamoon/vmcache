@@ -24,6 +24,7 @@
 #include <immintrin.h>
 
 #include "exmap.h"
+#include "lsmtree.cpp"
 
 __thread uint16_t workerThreadId = 0;
 __thread int32_t tpcchistorycounter = 0;
@@ -1590,6 +1591,7 @@ template <class Record>
 struct vmcacheAdapter
 {
    BTree tree;
+   LSMTree lsmTree;
 
    public:
    void scan(const typename Record::Key& key, const std::function<bool(const typename Record::Key&, const Record&)>& found_record_cb, std::function<void()> reset_if_scan_failed_cb) {
@@ -1628,7 +1630,14 @@ struct vmcacheAdapter
       u8 k[Record::maxFoldLength()];
       u16 l = Record::foldKey(k, key);
       tree.insert({k, l}, {(u8*)(&record), sizeof(Record)});
+      span<u8> kl = {k, l};
+      span<u8> payload = {(u8*)(&record), sizeof(Record)};
+      KeyValue kv(span_to_string(kl), span_to_string(payload));
+      lsmTree.insert(kv);
    }
+   auto span_to_string(span<unsigned char const> input_array) -> std::string {
+    return std::string(input_array.begin(), input_array.end());
+}
    // -------------------------------------------------------------------------------------
    template<class Fn>
    void lookup1(const typename Record::Key& key, Fn fn) {
