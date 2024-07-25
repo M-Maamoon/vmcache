@@ -37,10 +37,16 @@ typedef uint16_t u16;
 typedef uint32_t u32;
 typedef uint64_t u64;
 typedef u64 PID; // page id type
+// Defined the type for SSTable type
+typedef u64 TableId;
 
 static const u64 pageSize = 4096;
 
 struct alignas(4096) Page {
+   bool dirty;
+};
+
+struct SSTable {
    bool dirty;
 };
 
@@ -229,6 +235,7 @@ struct LibaioInterface {
    static const u64 maxIOs = 256;
 
    int blockfd;
+   int ssBlockFd;
    Page* virtMem;
    io_context_t ctx;
    iocb cb[maxIOs];
@@ -278,6 +285,7 @@ struct BufferManager {
 
    bool useExmap;
    int blockfd;
+   int ssTablesBlockFd;
    int exmapfd;
 
    atomic<u64> physUsedCount;
@@ -288,7 +296,10 @@ struct BufferManager {
    atomic<u64> writeCount;
 
    Page* virtMem;
+   Page* sstVirtMem;
+   SSTable* sstables;
    PageState* pageState;
+
    u64 batch;
 
    PageState& getPageState(PID pid) {
@@ -311,6 +322,8 @@ struct BufferManager {
    Page* allocPage();
    void handleFault(PID pid);
    void readPage(PID pid);
+   void readSSTable(TableId tableId);
+   void flushSSTable();
    void evict();
 };
 
@@ -590,43 +603,33 @@ u64 envOr(const char* env, u64 value) {
 BufferManager::BufferManager() : virtSize(envOr("VIRTGB", 16)*gb), physSize(envOr("PHYSGB", 4)*gb), virtCount(virtSize / pageSize), physCount(physSize / pageSize), residentSet(physCount) {
    assert(virtSize>=physSize);
    const char* path = getenv("BLOCK") ? getenv("BLOCK") : "/tmp/bm";
+   const char* ssTablePath = getenv("SSTABLE_BLOCK") ? getenv("SSTABLE_BLOCK") : "/tmp/sst";
    blockfd = open(path, O_RDWR | O_DIRECT, S_IRWXU);
+   ssTablesBlockFd = open(ssTablePath, O_RDWR | O_DIRECT, S_IRWXU);
    if (blockfd == -1) {
       cerr << "cannot open BLOCK device '" << path << "'" << endl;
       exit(EXIT_FAILURE);
    }
+   if (ssTablesBlockFd == -1) {
+      cerr << "cannot open BLOCK device for the SSTable '" << ssTablePath << "'" << endl;
+      exit(EXIT_FAILURE);
+   }
    u64 virtAllocSize = virtSize + (1<<16); // we allocate 64KB extra to prevent segfaults during optimistic reads
 
-   useExmap = envOr("EXMAP", 0);
-   if (useExmap) {
-      exmapfd = open("/dev/exmap", O_RDWR);
-      if (exmapfd < 0) die("open exmap");
+   // Allocating the virtual memory for the buffer pool to be 16GB + 64KB to be Anonyomus, i.e no file backing
+   virtMem = (Page*)mmap(NULL, virtAllocSize, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+   sstVirtMem = (Page*)mmap(NULL, 1 * gb, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+   madvise(virtMem, virtAllocSize, MADV_NOHUGEPAGE);
 
-      struct exmap_ioctl_setup buffer;
-      buffer.fd             = blockfd;
-      buffer.max_interfaces = maxWorkerThreads;
-      buffer.buffer_size    = physCount;
-      buffer.flags          = 0;
-      if (ioctl(exmapfd, EXMAP_IOCTL_SETUP, &buffer) < 0)
-         die("ioctl: exmap_setup");
-
-      for (unsigned i=0; i<maxWorkerThreads; i++) {
-         exmapInterface[i] = (struct exmap_user_interface *) mmap(NULL, pageSize, PROT_READ|PROT_WRITE, MAP_SHARED, exmapfd, EXMAP_OFF_INTERFACE(i));
-         if (exmapInterface[i] == MAP_FAILED)
-            die("setup exmapInterface");
-      }
-
-      virtMem = (Page*)mmap(NULL, virtAllocSize, PROT_READ|PROT_WRITE, MAP_SHARED, exmapfd, 0);
-   } else {
-      virtMem = (Page*)mmap(NULL, virtAllocSize, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
-      madvise(virtMem, virtAllocSize, MADV_NOHUGEPAGE);
-   }
-
+   // Allocating a Huge page for the PageState = (16GB/4096) * SizeOfPageState
    pageState = (PageState*)allocHuge(virtCount * sizeof(PageState));
    for (u64 i=0; i<virtCount; i++)
+      // Initialize the states of all Pages
       pageState[i].init();
    if (virtMem == MAP_FAILED)
       die("mmap failed");
+   if(sstVirtMem == MAP_FAILED)
+      die("mmap for SSTable failed");
 
    libaioInterface.reserve(maxWorkerThreads);
    for (unsigned i=0; i<maxWorkerThreads; i++)
@@ -655,7 +658,9 @@ Page* BufferManager::allocPage() {
       cerr << "VIRTGB is too low" << endl;
       exit(EXIT_FAILURE);
    }
+   // getting state and version of the next page to be allocated
    u64 stateAndVersion = getPageState(pid).stateAndVersion;
+   // Trying to lock that page
    bool succ = getPageState(pid).tryLockX(stateAndVersion);
    assert(succ);
    residentSet.insert(pid);
@@ -670,6 +675,7 @@ Page* BufferManager::allocPage() {
    }
    virtMem[pid].dirty = true;
 
+// Why do we return the address of virtMem + pid??
    return virtMem + pid;
 }
 
@@ -752,6 +758,21 @@ void BufferManager::readPage(PID pid) {
    }
 }
 
+
+void BufferManager::readSSTable(TableId tableId) {
+   // We start by reading SS1 which has a size of 4096 and starts at offset 0
+   // SS2 would have the size of 2 * 4096 and starts at offset 4096
+   int tableSize = tableId * 4096;
+   int tableOffset = (tableId - 1) * 4096;
+   int ret = pread(blockfd, sstVirtMem, tableSize, tableOffset);
+   assert(ret == tableSize);
+}
+
+void BufferManager::flushSSTable() {
+   // int ret = pwrite(ssTablesBlockFd, sstVirtMem, 1 * gb, 0);
+   // assert(ret == 1 * gb);
+}
+
 void BufferManager::evict() {
    vector<PID> toEvict;
    toEvict.reserve(batch);
@@ -803,17 +824,9 @@ void BufferManager::evict() {
    }
 
    // 4. remove from page table
-   if (useExmap) {
-      for (u64 i=0; i<toEvict.size(); i++) {
-         exmapInterface[workerThreadId]->iov[i].page = toEvict[i];
-         exmapInterface[workerThreadId]->iov[i].len = 1;
-      }
-      if (exmapAction(exmapfd, EXMAP_OP_FREE, toEvict.size()) < 0)
-         die("ioctl: EXMAP_OP_FREE");
-   } else {
-      for (u64& pid : toEvict)
-         madvise(virtMem + pid, pageSize, MADV_DONTNEED);
-   }
+
+   for (u64& pid : toEvict)
+      madvise(virtMem + pid, pageSize, MADV_DONTNEED);
 
    // 5. remove from hash table and unlock
    for (u64& pid : toEvict) {
