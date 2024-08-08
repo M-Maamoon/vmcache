@@ -12,7 +12,7 @@
 #include <thread>
 #include <vector>
 #include <span>
-
+#include <memory>
 #include <errno.h>
 #include <libaio.h>
 #include <sys/mman.h>
@@ -101,7 +101,7 @@ struct BufferManager {
 };
 
 
-BufferManager bm;
+std::shared_ptr<BufferManager> bm = std::make_shared<BufferManager>();
 
 struct OLCRestartException {};
 
@@ -113,7 +113,7 @@ struct GuardO {
    static const u64 moved = ~0ull;
 
    // constructor
-   explicit GuardO(u64 pid) : pid(pid), ptr(reinterpret_cast<T*>(bm.toPtr(pid))) {
+   explicit GuardO(u64 pid) : pid(pid), ptr(reinterpret_cast<T*>(bm->toPtr(pid))) {
       init();
    }
 
@@ -121,7 +121,7 @@ struct GuardO {
    GuardO(u64 pid, GuardO<T2>& parent)  {
       parent.checkVersionAndRestart();
       this->pid = pid;
-      ptr = reinterpret_cast<T*>(bm.toPtr(pid));
+      ptr = reinterpret_cast<T*>(bm->toPtr(pid));
       init();
    }
 
@@ -133,7 +133,7 @@ struct GuardO {
 
    void init() {
       assert(pid != moved);
-      PageState& ps = bm.getPageState(pid);
+      PageState& ps = bm->getPageState(pid);
       for (u64 repeatCounter=0; ; repeatCounter++) {
          u64 v = ps.stateAndVersion.load();
          switch (PageState::getState(v)) {
@@ -149,8 +149,8 @@ struct GuardO {
                break;
             case PageState::Evicted:
                if (ps.tryLockX(v)) {
-                  bm.handleFault(pid);
-                  bm.unfixX(pid);
+                  bm->handleFault(pid);
+                  bm->unfixX(pid);
                }
                break;
             default:
@@ -181,7 +181,7 @@ struct GuardO {
 
    void checkVersionAndRestart() {
       if (pid != moved) {
-         PageState& ps = bm.getPageState(pid);
+         PageState& ps = bm->getPageState(pid);
          u64 stateAndVersion = ps.stateAndVersion.load();
          if (version == stateAndVersion) // fast path, nothing changed
             return;
@@ -226,14 +226,14 @@ struct GuardX {
 
    // constructor
    explicit GuardX(u64 pid) : pid(pid) {
-      ptr = reinterpret_cast<T*>(bm.fixX(pid));
+      ptr = reinterpret_cast<T*>(bm->fixX(pid));
       ptr->dirty = true;
    }
 
    explicit GuardX(GuardO<T>&& other) {
       assert(other.pid != moved);
       for (u64 repeatCounter=0; ; repeatCounter++) {
-         PageState& ps = bm.getPageState(other.pid);
+         PageState& ps = bm->getPageState(other.pid);
          u64 stateAndVersion = ps.stateAndVersion;
          if ((stateAndVersion<<8) != (other.version<<8))
             throw OLCRestartException();
@@ -258,7 +258,7 @@ struct GuardX {
    // move assignment operator
    GuardX& operator=(GuardX&& other) {
       if (pid != moved) {
-         bm.unfixX(pid);
+         bm->unfixX(pid);
       }
       pid = other.pid;
       ptr = other.ptr;
@@ -273,7 +273,7 @@ struct GuardX {
    // destructor
    ~GuardX() {
       if (pid != moved)
-         bm.unfixX(pid);
+         bm->unfixX(pid);
    }
 
    T* operator->() {
@@ -283,7 +283,7 @@ struct GuardX {
 
    void release() {
       if (pid != moved) {
-         bm.unfixX(pid);
+         bm->unfixX(pid);
          pid = moved;
       }
    }
@@ -293,9 +293,9 @@ template<class T>
 struct AllocGuard : public GuardX<T> {
    template <typename ...Params>
    AllocGuard(Params&&... params) {
-      GuardX<T>::ptr = reinterpret_cast<T*>(bm.allocPage());
+      GuardX<T>::ptr = reinterpret_cast<T*>(bm->allocPage());
       new (GuardX<T>::ptr) T(std::forward<Params>(params)...);
-      GuardX<T>::pid = bm.toPID(GuardX<T>::ptr);
+      GuardX<T>::pid = bm->toPID(GuardX<T>::ptr);
    }
 };
 
@@ -307,12 +307,12 @@ struct GuardS {
 
    // constructor
    explicit GuardS(u64 pid) : pid(pid) {
-      ptr = reinterpret_cast<T*>(bm.fixS(pid));
+      ptr = reinterpret_cast<T*>(bm->fixS(pid));
    }
 
    GuardS(GuardO<T>&& other) {
       assert(other.pid != moved);
-      if (bm.getPageState(other.pid).tryLockS(other.version)) { // XXX: optimize?
+      if (bm->getPageState(other.pid).tryLockS(other.version)) { // XXX: optimize?
          pid = other.pid;
          ptr = other.ptr;
          other.pid = moved;
@@ -324,7 +324,7 @@ struct GuardS {
 
    GuardS(GuardS&& other) {
       if (pid != moved)
-         bm.unfixS(pid);
+         bm->unfixS(pid);
       pid = other.pid;
       ptr = other.ptr;
       other.pid = moved;
@@ -337,7 +337,7 @@ struct GuardS {
    // move assignment operator
    GuardS& operator=(GuardS&& other) {
       if (pid != moved)
-         bm.unfixS(pid);
+         bm->unfixS(pid);
       pid = other.pid;
       ptr = other.ptr;
       other.pid = moved;
@@ -351,7 +351,7 @@ struct GuardS {
    // destructor
    ~GuardS() {
       if (pid != moved)
-         bm.unfixS(pid);
+         bm->unfixS(pid);
    }
 
    T* operator->() {
@@ -361,7 +361,7 @@ struct GuardS {
 
    void release() {
       if (pid != moved) {
-         bm.unfixS(pid);
+         bm->unfixS(pid);
          pid = moved;
       }
    }
@@ -873,7 +873,7 @@ struct BTreeNode : public BTreeNodeHeader {
          return false;
       copyKeyValueRange(&tmp, 0, 0, count);
       right->copyKeyValueRange(&tmp, count, 0, right->count);
-      PID pid = bm.toPID(this);
+      PID pid = bm->toPID(this);
       memcpy(parent->getPayload(slotId+1).data(), &pid, sizeof(PID));
       parent->removeSlot(slotId);
       tmp.makeHint();
@@ -967,7 +967,7 @@ struct BTreeNode : public BTreeNodeHeader {
       nodeLeft->setFences(getLowerFence(), sep);
       nodeRight->setFences(sep, getUpperFence());
 
-      PID leftPID = bm.toPID(this);
+      PID leftPID = bm->toPID(this);
       u16 oldParentSlot = parent->lowerBound(sep);
       if (oldParentSlot == parent->count) {
          assert(parent->upperInnerNode == leftPID);
@@ -1351,8 +1351,8 @@ typedef u64 KeyType;
 
 void handleSEGFAULT(int signo, siginfo_t* info, void* extra) {
    void* page = info->si_addr;
-   if (bm.isValidPtr(page)) {
-      cerr << "segfault restart " << bm.toPID(page) << endl;
+   if (bm->isValidPtr(page)) {
+      cerr << "segfault restart " << bm->toPID(page) << endl;
       throw OLCRestartException();
    } else {
       cerr << "segfault " << page << endl;
@@ -1487,7 +1487,7 @@ void parallel_for(uint64_t begin, uint64_t end, uint64_t nthreads, Fn fn) {
 }
 
 int main(int argc, char** argv) {
-   if (bm.useExmap) {
+   if (bm->useExmap) {
       struct sigaction action;
       action.sa_flags = SA_SIGINFO;
       action.sa_sigaction = handleSEGFAULT;
@@ -1505,17 +1505,17 @@ int main(int argc, char** argv) {
    u64 statDiff = 1e8;
    atomic<u64> txProgress(0);
    atomic<bool> keepRunning(true);
-   auto systemName = bm.useExmap ? "exmap" : "vmcache";
+   auto systemName = bm->useExmap ? "exmap" : "vmcache";
 
    auto statFn = [&]() {
       cout << "ts,tx,rmb,wmb,system,threads,datasize,workload,batch" << endl;
       u64 cnt = 0;
       for (uint64_t i=0; i<runForSec; i++) {
          sleep(1);
-         float rmb = (bm.readCount.exchange(0)*pageSize)/(1024.0*1024);
-         float wmb = (bm.writeCount.exchange(0)*pageSize)/(1024.0*1024);
+         float rmb = (bm->readCount.exchange(0)*pageSize)/(1024.0*1024);
+         float wmb = (bm->writeCount.exchange(0)*pageSize)/(1024.0*1024);
          u64 prog = txProgress.exchange(0);
-         cout << cnt++ << "," << prog << "," << rmb << "," << wmb << "," << systemName << "," << nthreads << "," << n << "," << (isRndread?"rndread":"tpcc") << "," << bm.batch << endl;
+         cout << cnt++ << "," << prog << "," << rmb << "," << wmb << "," << systemName << "," << nthreads << "," << n << "," << (isRndread?"rndread":"tpcc") << "," << bm->batch << endl;
       }
       keepRunning = false;
    };
@@ -1537,10 +1537,10 @@ int main(int argc, char** argv) {
             }
          });
       }
-      cerr << "space: " << (bm.allocCount.load()*pageSize)/(float)bm.gb << " GB " << endl;
+      cerr << "space: " << (bm->allocCount.load()*pageSize)/(float)bm->gb << " GB " << endl;
 
-      bm.readCount = 0;
-      bm.writeCount = 0;
+      bm->readCount = 0;
+      bm->writeCount = 0;
       thread statThread(statFn);
 
       parallel_for(0, nthreads, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
@@ -1606,10 +1606,10 @@ int main(int argc, char** argv) {
          }
       });
    }
-   cerr << "space: " << (bm.allocCount.load()*pageSize)/(float)bm.gb << " GB " << endl;
+   cerr << "space: " << (bm->allocCount.load()*pageSize)/(float)bm->gb << " GB " << endl;
 
-   bm.readCount = 0;
-   bm.writeCount = 0;
+   bm->readCount = 0;
+   bm->writeCount = 0;
    thread statThread(statFn);
 
    parallel_for(0, nthreads, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
@@ -1631,7 +1631,7 @@ int main(int argc, char** argv) {
    });
 
    statThread.join();
-   cerr << "space: " << (bm.allocCount.load()*pageSize)/(float)bm.gb << " GB " << endl;
+   cerr << "space: " << (bm->allocCount.load()*pageSize)/(float)bm->gb << " GB " << endl;
 
    return 0;
 }
