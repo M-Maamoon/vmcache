@@ -651,19 +651,6 @@ struct BTreeNodeHeader {
    ~BTreeNodeHeader() {}
 };
 
-static unsigned min(unsigned a, unsigned b)
-{
-   return a < b ? a : b;
-}
-
-template <class T>
-static T loadUnaligned(void* p)
-{
-   T x;
-   memcpy(&x, p, sizeof(T));
-   return x;
-}
-
 // Get order-preserving head of key (assuming little endian)
 static u32 head(u8* key, unsigned keyLen)
 {

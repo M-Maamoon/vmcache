@@ -19,3 +19,14 @@ uint64_t rdtsc() {
     __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
     return static_cast<uint64_t>(lo) | (static_cast<uint64_t>(hi) << 32);
 }
+
+static unsigned min(unsigned a, unsigned b) {
+    return a < b ? a : b;
+}
+
+template <class T>
+static T loadUnaligned(void* p) {
+    T x;
+    memcpy(&x, p, sizeof(T));
+    return x;
+}
